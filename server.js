@@ -150,6 +150,7 @@ function extractImageData(solution, imageUrl) {
   if (typeof response === 'string' &&
       (response.includes('<!DOCTYPE') || response.includes('<html'))) {
     console.log(`[Extract] Got HTML instead of image`);
+    console.log(`[Extract] HTML preview: ${response.substring(0, 500)}`);
     return null;
   }
 
