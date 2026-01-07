@@ -4,13 +4,8 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// FlareSolverr URL - when running on same Railway project, use internal networking
-// Otherwise use the public URL
+// FlareSolverr URL
 const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || 'http://localhost:8191/v1';
-
-// Cache cookies per domain to avoid solving challenges repeatedly
-const cookieCache = new Map();
-const COOKIE_TTL = 10 * 60 * 1000; // 10 minutes
 
 // CORS middleware
 app.use((req, res, next) => {
@@ -29,85 +24,164 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * Get cookies from FlareSolverr for a domain
+ * Use FlareSolverr to fetch image directly
+ * This ensures the same IP is used for both challenge solving AND image download
  */
-async function getCookies(url) {
-  const domain = new URL(url).hostname;
+async function fetchImageViaFlareSolverr(imageUrl) {
+  console.log(`[FlareSolverr] Fetching image directly: ${imageUrl}`);
 
-  // Check cache first
-  const cached = cookieCache.get(domain);
-  if (cached && Date.now() - cached.timestamp < COOKIE_TTL) {
-    console.log(`[Cache] Using cached cookies for ${domain}`);
-    return cached;
+  const response = await fetch(FLARESOLVERR_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      cmd: 'request.get',
+      url: imageUrl,
+      maxTimeout: 60000,
+      // Request raw download for binary content
+      download: true,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`FlareSolverr HTTP error: ${response.status}`);
   }
 
-  console.log(`[FlareSolverr] Solving challenge for ${domain}...`);
+  const data = await response.json();
 
+  if (data.status !== 'ok' || !data.solution) {
+    throw new Error(data.message || 'FlareSolverr request failed');
+  }
+
+  // FlareSolverr returns the response content
+  // For images, this should be base64 encoded if download: true is used
+  // Otherwise it's in solution.response
+  return data.solution;
+}
+
+/**
+ * Alternative: Use session-based approach
+ * Create a session, solve challenge on main domain, then fetch image
+ */
+async function fetchImageWithSession(imageUrl) {
+  const domain = new URL(imageUrl).hostname;
+  const sessionId = `img_${domain.replace(/\./g, '_')}`;
+
+  console.log(`[Session] Using session ${sessionId} for ${domain}`);
+
+  // Step 1: Create/reuse session and solve challenge on main domain
+  const challengeResponse = await fetch(FLARESOLVERR_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      cmd: 'request.get',
+      url: `https://${domain}/`,
+      session: sessionId,
+      maxTimeout: 60000,
+    }),
+  });
+
+  if (!challengeResponse.ok) {
+    throw new Error(`FlareSolverr challenge HTTP error: ${challengeResponse.status}`);
+  }
+
+  const challengeData = await challengeResponse.json();
+
+  if (challengeData.status !== 'ok') {
+    throw new Error(challengeData.message || 'Challenge failed');
+  }
+
+  console.log(`[Session] Challenge solved, now fetching image...`);
+
+  // Step 2: Now fetch the image using the same session (same browser, same cookies, same IP)
+  const imageResponse = await fetch(FLARESOLVERR_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      cmd: 'request.get',
+      url: imageUrl,
+      session: sessionId,
+      maxTimeout: 60000,
+    }),
+  });
+
+  if (!imageResponse.ok) {
+    throw new Error(`FlareSolverr image HTTP error: ${imageResponse.status}`);
+  }
+
+  const imageData = await imageResponse.json();
+
+  if (imageData.status !== 'ok' || !imageData.solution) {
+    // Clean up session on failure
+    await destroySession(sessionId);
+    throw new Error(imageData.message || 'Image fetch failed');
+  }
+
+  return imageData.solution;
+}
+
+async function destroySession(sessionId) {
   try {
-    const response = await fetch(FLARESOLVERR_URL, {
+    await fetch(FLARESOLVERR_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        cmd: 'request.get',
-        url: url,
-        maxTimeout: 60000,
+        cmd: 'sessions.destroy',
+        session: sessionId,
       }),
     });
-
-    if (!response.ok) {
-      throw new Error(`FlareSolverr HTTP error: ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    if (data.status !== 'ok' || !data.solution) {
-      throw new Error(data.message || 'FlareSolverr request failed');
-    }
-
-    const result = {
-      cookies: data.solution.cookies || [],
-      userAgent: data.solution.userAgent,
-      timestamp: Date.now(),
-    };
-
-    // Cache the cookies
-    cookieCache.set(domain, result);
-    console.log(`[FlareSolverr] Got ${result.cookies.length} cookies for ${domain}`);
-
-    return result;
-  } catch (error) {
-    console.error(`[FlareSolverr] Error:`, error.message);
-    throw error;
+  } catch (e) {
+    // Ignore cleanup errors
   }
 }
 
 /**
- * Fetch image using cookies from the same IP
+ * Extract image from FlareSolverr response
+ * FlareSolverr returns HTML by default, but for images we need the raw data
  */
-async function fetchImageWithCookies(url, cookies, userAgent) {
-  const cookieHeader = cookies
-    .map(c => `${c.name}=${c.value}`)
-    .join('; ');
+function extractImageFromResponse(solution, imageUrl) {
+  // If response looks like base64 image data
+  if (solution.response && !solution.response.startsWith('<') && !solution.response.startsWith('{')) {
+    // Might be raw binary - try to decode
+    return {
+      buffer: Buffer.from(solution.response, 'binary'),
+      contentType: guessContentType(imageUrl),
+    };
+  }
 
-  console.log(`[Fetch] Downloading image: ${url}`);
+  // Check if there's a headers object with content-type
+  const contentType = solution.headers?.['content-type'] || guessContentType(imageUrl);
 
-  const response = await fetch(url, {
-    headers: {
-      'Cookie': cookieHeader,
-      'User-Agent': userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Referer': new URL(url).origin + '/',
-      'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"',
-      'sec-fetch-dest': 'image',
-      'sec-fetch-mode': 'no-cors',
-      'sec-fetch-site': 'same-origin',
-    },
-  });
+  // FlareSolverr may return the image as part of the response
+  if (solution.response) {
+    // Try to extract the image data
+    const response = solution.response;
 
-  return response;
+    // If it's HTML, the image fetch failed (got Cloudflare page)
+    if (response.includes('<!DOCTYPE') || response.includes('<html')) {
+      return null;
+    }
+
+    // Otherwise, assume it's binary image data
+    return {
+      buffer: Buffer.from(response, 'binary'),
+      contentType,
+    };
+  }
+
+  return null;
+}
+
+function guessContentType(url) {
+  const ext = url.split('.').pop()?.toLowerCase().split('?')[0];
+  const types = {
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'png': 'image/png',
+    'gif': 'image/gif',
+    'webp': 'image/webp',
+    'avif': 'image/avif',
+  };
+  return types[ext] || 'image/jpeg';
 }
 
 /**
@@ -126,53 +200,24 @@ app.get('/image', async (req, res) => {
   }
 
   try {
-    // Step 1: Get cookies from FlareSolverr
-    const { cookies, userAgent } = await getCookies(imageUrl);
+    // Use session-based approach for proper IP binding
+    const solution = await fetchImageWithSession(imageUrl);
+    const imageData = extractImageFromResponse(solution, imageUrl);
 
-    if (!cookies || cookies.length === 0) {
-      console.log(`[Proxy] No cookies obtained, trying direct fetch`);
+    if (!imageData) {
+      console.error(`[Proxy] Could not extract image from response`);
+      return res.status(500).json({ error: 'Could not extract image data' });
     }
 
-    // Step 2: Fetch the image using cookies (from Railway's IP - same as FlareSolverr)
-    const imageResponse = await fetchImageWithCookies(imageUrl, cookies, userAgent);
-
-    if (!imageResponse.ok) {
-      console.error(`[Proxy] Image fetch failed: ${imageResponse.status}`);
-      return res.status(imageResponse.status).json({
-        error: `Image fetch failed: ${imageResponse.status}`
-      });
-    }
-
-    const contentType = imageResponse.headers.get('content-type') || 'application/octet-stream';
-
-    // Verify it's an image
-    if (!contentType.startsWith('image/')) {
-      console.error(`[Proxy] Got non-image content: ${contentType}`);
-
-      // If we got HTML, the challenge might have failed - clear cache and retry
-      if (contentType.includes('text/html')) {
-        const domain = new URL(imageUrl).hostname;
-        cookieCache.delete(domain);
-        console.log(`[Proxy] Cleared cache for ${domain}, got HTML instead of image`);
-      }
-
-      return res.status(500).json({
-        error: 'Received non-image content',
-        contentType
-      });
-    }
-
-    // Step 3: Stream the image back
-    const buffer = await imageResponse.buffer();
-    console.log(`[Proxy] Success: ${contentType}, ${buffer.length} bytes`);
+    console.log(`[Proxy] Success: ${imageData.contentType}, ${imageData.buffer.length} bytes`);
 
     res.set({
-      'Content-Type': contentType,
-      'Content-Length': buffer.length,
+      'Content-Type': imageData.contentType,
+      'Content-Length': imageData.buffer.length,
       'Cache-Control': 'public, max-age=86400, immutable',
     });
 
-    return res.send(buffer);
+    return res.send(imageData.buffer);
 
   } catch (error) {
     console.error(`[Proxy] Error:`, error.message);
@@ -183,47 +228,31 @@ app.get('/image', async (req, res) => {
 /**
  * Base64 endpoint for Cloudinary uploads
  * GET /image/base64?url=<encoded-url>
- * Returns: { success: true, base64: "...", contentType: "image/jpeg" }
  */
 app.get('/image/base64', async (req, res) => {
   const imageUrl = req.query.url;
 
   if (!imageUrl) {
-    return res.status(400).json({ error: 'url parameter required' });
+    return res.status(400).json({ success: false, error: 'url parameter required' });
   }
 
   try {
-    const { cookies, userAgent } = await getCookies(imageUrl);
-    const imageResponse = await fetchImageWithCookies(imageUrl, cookies, userAgent);
+    const solution = await fetchImageWithSession(imageUrl);
+    const imageData = extractImageFromResponse(solution, imageUrl);
 
-    if (!imageResponse.ok) {
-      return res.json({
-        success: false,
-        error: `Image fetch failed: ${imageResponse.status}`
-      });
+    if (!imageData) {
+      return res.json({ success: false, error: 'Could not extract image data - got HTML instead of image' });
     }
 
-    const contentType = imageResponse.headers.get('content-type') || 'image/jpeg';
+    const base64 = imageData.buffer.toString('base64');
 
-    if (!contentType.startsWith('image/')) {
-      const domain = new URL(imageUrl).hostname;
-      cookieCache.delete(domain);
-      return res.json({
-        success: false,
-        error: 'Received non-image content'
-      });
-    }
-
-    const buffer = await imageResponse.buffer();
-    const base64 = buffer.toString('base64');
-
-    console.log(`[Base64] Success: ${contentType}, ${buffer.length} bytes`);
+    console.log(`[Base64] Success: ${imageData.contentType}, ${imageData.buffer.length} bytes`);
 
     return res.json({
       success: true,
       base64,
-      contentType,
-      size: buffer.length,
+      contentType: imageData.contentType,
+      size: imageData.buffer.length,
     });
 
   } catch (error) {
